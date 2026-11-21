@@ -7,8 +7,8 @@ import {
   GraduationCap, History as HistoryIcon, LayoutDashboard, Library, Link2, LogOut, Menu, Moon, MoreHorizontal,
   RefreshCw, Search, ShieldCheck, ShieldAlert, Sparkles, Sun, Trash2, UploadCloud, UserRound, X, Zap
 } from 'lucide-react';
-import { supabase } from '@/lib/supabase';
-import { Language, t } from '@/i18n';
+import { supabase } from './supabase';
+import { Language, t } from './i18n';
 import './index.css';
 
 GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${'4.4.168'}/pdf.worker.min.mjs`;
