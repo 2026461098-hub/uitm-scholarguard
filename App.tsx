@@ -13,21 +13,24 @@ import './index.css';
 
 GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${'4.4.168'}/pdf.worker.min.mjs`;
 
+const DOCX_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
 interface SourceMatch { sourceName: string; sourceType: string; location: string; matchPercent: number; url: string }
 interface Highlight { sentence: string; type: 'similarity' | 'ai'; suggestions: string[]; source?: SourceMatch }
-interface TextPiece { text: string; breakBefore: boolean }
 interface ReferenceIssue { type: 'missing' | 'incomplete' | 'broken-link' | 'hallucination' | 'format'; reference: string; detail: string; suggestion: string }
 interface ReferenceCheck { hasReferences: boolean; issues: ReferenceIssue[]; references: string[] }
 interface DocumentRecord {
   id: string; file_name: string; file_type: string; file_size: number; extracted_text: string;
+  original_extract?: string | null;
   similarity_index: number; ai_detection: number; internet_sources: number; uitm_sources: number;
   highlights: Highlight[]; suggestions: Highlight[]; reference_check?: ReferenceCheck; status: string; created_at: string;
 }
 interface UserProfile { id: string; email?: string; role: 'Pelajar' | 'Pensyarah'; demo?: boolean }
 interface Reference { title: string; provider: string; field: string; description: string; url: string; featured?: boolean }
+interface DisplayBlock { kind: 'text' | 'heading' | 'html'; text?: string; html?: string; level?: number }
 
 const logoPath = '/uitm-universiti-teknologi-mara-logo-png-transparent.png';
-const demoText = 'Integriti akademik merupakan asas kepada budaya ilmu yang bertanggungjawab. Setiap penulis perlu mengiktiraf sumbangan dan idea orang lain melalui rujukan yang tepat. Penggunaan teknologi kecerdasan buatan pula hendaklah disertai pertimbangan etika dan semakan manusia. Penyelidikan yang berkualiti dibina melalui proses membaca, menilai, dan menulis semula dengan kefahaman yang sebenar.';
+const demoText = 'Integriti akademik merupakan asas kepada budaya ilmu yang bertanggungjawab. Setiap penulis perlu mengiktiraf sumbangan dan idea orang lain melalui rujukan yang tepat (Hassan dan Rosli 2022). Penggunaan teknologi kecerdasan buatan pula hendaklah disertai pertimbangan etika dan semakan manusia. Penyelidikan yang berkualiti dibina melalui proses membaca, menilai, dan menulis semula dengan kefahaman yang sebenar.\n\nRUJUKAN\nHassan, A. dan Rosli, B. (2022). Integriti Akademik di Institusi Pengajian Tinggi. Penerbit UiTM.\nInternational Journal for Educational Integrity. https://link.springer.com/journal/40979';
 
 const references: Reference[] = [
   { title: 'UiTM Institutional Repository (IR)', provider: 'Universiti Teknologi MARA', field: 'Pelbagai bidang', description: 'Repositori rasmi bahan ilmiah, tesis, artikel dan penerbitan UiTM.', url: 'https://ir.uitm.edu.my', featured: true },
@@ -77,75 +80,230 @@ function generateSuggestions(sentence: string, variation = 0): string[] {
   return variants[variation % variants.length];
 }
 
-function getMainContent(text: string): string {
-  const normalized = text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
-  const startMatch = normalized.match(/(?:^|\n)\s*(?:(?:bab|chapter)\s*1\s*[:.-]?\s*)?(?:1\.0\s*)?(?:pengenalan|introduction)\s*[:.-]?\s*(?:\n|$)/im);
-  if (!startMatch) return '';
-  const afterStart = normalized.slice(startMatch.index! + startMatch[0].length);
-  const endMatch = afterStart.match(/\n\s*(?:(?:bab|chapter)\s*[2-9]\s*[:.-]?\s*)?(?:rujukan|references|bibliografi|bibliography)\s*[:.-]?\s*(?:\n|$)/im);
-  const end = endMatch?.index ?? afterStart.length;
-  return afterStart.slice(0, end).trim();
+/* ---------- Document text handling ---------- */
+
+function normalizeDocument(text: string): string {
+  return text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
-function getReferenceSection(text: string): string {
-  const normalized = text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
-  const match = normalized.match(/(?:^|\n)\s*(?:rujukan|references|bibliografi|bibliography)\s*[:.-]?\s*(?:\n|$)/im);
-  if (!match) return '';
-  return normalized.slice(match.index! + match[0].length).trim();
+// A heading candidate line: short, contains the keyword, and everything around it
+// looks like numbering / capitalised heading words (e.g. "10.0 RUJUKAN").
+const REF_KEYWORD = /\b(rujukan|references|bibliografi|bibliography|bukti dan lampiran|lampiran sumbangan)\b/i;
+const INTRO_KEYWORD = /\b(pengenalan|introduction)\b/i;
+const HEADING_LEFTOVER = /^[\s\d.\-–—:()&,A-Z'*]*$/;
+
+function lineIsHeading(line: string, keyword: RegExp): boolean {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.length > 90) return false;
+  if (/\.{2,}\s*\d+\s*$/.test(trimmed)) return false;
+  return HEADING_LEFTOVER.test(trimmed.replace(keyword, ''));
 }
 
-function getTextPieces(text: string): TextPiece[] {
-  return text.split(/\n+/).map((line) => line.trim()).filter(Boolean).flatMap((line) => {
-    const sentences = line.match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.map((sentence) => sentence.trim()).filter(Boolean) ?? [];
-    return sentences.map((sentence) => ({ text: sentence, breakBefore: true }));
+function findIntroStart(normalized: string): number {
+  let pos = 0;
+  for (const line of normalized.split('\n')) {
+    pos += line.length + 1;
+    if (lineIsHeading(line, INTRO_KEYWORD)) return pos;
+  }
+  return -1;
+}
+
+function findRefsStart(normalized: string): number {
+  let pos = 0;
+  let found = -1;
+  for (const line of normalized.split('\n')) {
+    pos += line.length + 1;
+    if (lineIsHeading(line, REF_KEYWORD)) found = pos;
+  }
+  return found;
+}
+
+// Analysis scope: only the main body (after the first Introduction heading,
+// before the References heading). Front matter, cover pages, mark rubrics,
+// declarations and the table of contents are excluded entirely.
+function getMainContent(normalized: string): string {
+  const intro = findIntroStart(normalized);
+  const refs = findRefsStart(normalized);
+  const start = intro >= 0 ? intro : 0;
+  const end = refs > start ? refs : normalized.length;
+  return normalized.slice(start, end);
+}
+
+// Sentence splitting that never breaks numbered headings (1.0 PENGENALAN),
+// academic abbreviations (et al., hlm., Vol., No.) or URLs.
+const ABBREVIATIONS = /\b(?:et al|hlm|vol|no|pp|p|pg|ed|eds|jr|dr|prof|madam|mr|ms|fig|rajah|jadual|min|max|etc|sdn|bhd|ber|tar|said|ante|cf|ibid|i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii)\.$/i;
+
+function splitSentences(text: string): string[] {
+  const urls: string[] = [];
+  const protectedText = text.replace(/https?:\/\/[^\s)\]}>"']+/gi, (match) => {
+    urls.push(match);
+    return `__URL${urls.length - 1}__`;
   });
+  const rawTokens = protectedText.match(/[^.!?]+[.!?]+|[^.!?]+$/g) ?? [];
+  const merged: string[] = [];
+  for (const rawToken of rawTokens) {
+    const token = rawToken.trim();
+    if (!token) continue;
+    const previous = merged[merged.length - 1];
+    const previousTrimmed = previous?.trim() ?? '';
+    const previousEndsNumber = /\b\d+\.$/.test(previousTrimmed);
+    const previousEndsAbbrev = ABBREVIATIONS.test(previousTrimmed);
+    const tokenStartsLower = /^[a-z("'“]/.test(token);
+    const tokenStartsDigit = /^[0-9]/.test(token);
+    if (previous && (previousEndsAbbrev || (previousEndsNumber && tokenStartsLower) || (previousEndsNumber && tokenStartsDigit && token.length < 60))) {
+      merged[merged.length - 1] = `${previous} ${token}`;
+    } else {
+      merged.push(token);
+    }
+  }
+  return merged.map((sentence) => sentence.replace(/__URL(\d+)__/g, (_, index) => urls[Number(index)] ?? ''));
 }
+
+function htmlToPlainText(html: string): string {
+  const parsed = new DOMParser().parseFromString(html, 'text/html');
+  parsed.querySelectorAll('style, script').forEach((element) => element.remove());
+  parsed.querySelectorAll('table').forEach((table) => {
+    const text = Array.from(table.querySelectorAll('tr'))
+      .map((row) => Array.from(row.querySelectorAll('th, td')).map((cell) => cell.textContent?.trim()).filter(Boolean).join('\t'))
+      .filter(Boolean).join('\n');
+    table.replaceWith(text);
+  });
+  const blocks = Array.from(parsed.body.querySelectorAll('h1, h2, h3, h4, h5, h6, p, li, blockquote'));
+  if (blocks.length) return blocks.map((element) => element.textContent?.trim()).filter(Boolean).join('\n\n');
+  return parsed.body.textContent?.replace(/\n{2,}/g, '\n\n').trim() ?? '';
+}
+
+// Preserves the original document structure: real tables, lists, images and
+// headings become their own block; only plain paragraphs are sentence-split.
+function splitHtmlBlocks(html: string): DisplayBlock[] {
+  const parsed = new DOMParser().parseFromString(html, 'text/html');
+  const blocks: DisplayBlock[] = [];
+  Array.from(parsed.body.childNodes).forEach((node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent?.trim();
+      if (text) blocks.push({ kind: 'text', text });
+      return;
+    }
+    const element = node as Element;
+    const tag = element.tagName?.toLowerCase() ?? '';
+    if (['table', 'ul', 'ol', 'pre', 'blockquote', 'img'].includes(tag)) {
+      blocks.push({ kind: 'html', html: element.outerHTML });
+      return;
+    }
+    const text = element.textContent?.trim() ?? '';
+    if (!text) return;
+    if (/^h[1-6]$/.test(tag)) blocks.push({ kind: 'heading', level: Number(tag[1]), text });
+    else blocks.push({ kind: 'text', text });
+  });
+  return blocks;
+}
+
+/* ---------- Reference integrity check ---------- */
 
 function verifyReferences(text: string, language: Language): ReferenceCheck {
-  const refSection = getReferenceSection(text);
-  const references = refSection ? refSection.split(/\n+/).map((line) => line.trim()).filter((line) => line.length > 5) : [];
-  const issues: ReferenceIssue[] = [];
-  if (!refSection || references.length === 0) {
-    issues.push({ type: 'missing', reference: '', detail: language === 'bm' ? 'Dokumen ini tidak mempunyai senarai Rujukan atau Bibliografi.' : 'This document has no References or Bibliography section.', suggestion: language === 'bm' ? 'Tambah bahagian Rujukan di hujung dokumen mengikut format APA, Harvard atau IEEE.' : 'Add a References section at the end following APA, Harvard or IEEE format.' });
-    return { hasReferences: false, issues, references: [] };
+  const normalized = normalizeDocument(text);
+  const refsStart = findRefsStart(normalized);
+  const refSection = refsStart >= 0 ? normalized.slice(refsStart) : '';
+  const entries = refSection
+    ? refSection.split(/\n+/).map((line) => line.trim()).filter((line) => line.length > 5 && !lineIsHeading(line, REF_KEYWORD))
+    : [];
+  const citations = [...normalized.matchAll(/\([^()\n]{0,200}?\b(?:19|20)\d{2}\b[^()\n]{0,200}?\)/g)].map((match) => match[0].trim());
+  const urls = [...normalized.matchAll(/https?:\/\/[^\s)>\]}"',]+/g)].map((match) => match[0]);
+
+  if (entries.length === 0 && citations.length === 0 && urls.length === 0) {
+    return {
+      hasReferences: false,
+      issues: [{
+        type: 'missing', reference: '',
+        detail: language === 'bm' ? 'Dokumen ini tidak mempunyai senarai Rujukan, Bibliografi, sitasi dalam teks atau pautan rujukan.' : 'This document has no References, Bibliography, in-text citations or reference links.',
+        suggestion: language === 'bm' ? 'Tambah bahagian Rujukan di hujung dokumen mengikut format APA, Harvard atau IEEE.' : 'Add a References section at the end following APA, Harvard or IEEE format.',
+      }],
+      references: [],
+    };
   }
-  references.forEach((ref) => {
+
+  const issues: ReferenceIssue[] = [];
+  entries.forEach((ref) => {
+    const hasUrl = /https?:\/\//i.test(ref);
+    const hasYear = /\b(19|20)\d{2}\b/.test(ref) || /\bdoi\b/i.test(ref);
     if (/file:\/\//i.test(ref) || /^[A-Z]:\\/i.test(ref)) {
-      issues.push({ type: 'broken-link', reference: ref, detail: language === 'bm' ? 'Pautan rujukan merujuk kepada fail tempatan yang tidak akan berfungsi pada peranti lain.' : 'Reference link points to a local file that will not work on other devices.', suggestion: language === 'bm' ? 'Gantikan dengan pautan dalam talian atau DOI yang sah.' : 'Replace with a valid online link or DOI.' });
+      issues.push({
+        type: 'broken-link', reference: ref,
+        detail: language === 'bm' ? 'Pautan rujukan merujuk kepada fail tempatan yang tidak akan berfungsi pada peranti lain.' : 'Reference link points to a local file that will not work on other devices.',
+        suggestion: language === 'bm' ? 'Gantikan dengan pautan dalam talian atau DOI yang sah.' : 'Replace with a valid online link or DOI.',
+      });
     }
-    if (!/\b(19|20)\d{2}\b/.test(ref) && !/\bdoi\b|\bDOI\b/.test(ref)) {
-      issues.push({ type: 'incomplete', reference: ref, detail: language === 'bm' ? 'Rujukan ini tidak mempunyai tahun penerbitan yang jelas.' : 'This reference is missing a clear publication year.', suggestion: language === 'bm' ? 'Tambah tahun penerbitan dan nama penerbit untuk melengkapkan format rujukan.' : 'Add the publication year and publisher name to complete the reference format.' });
+    if (!hasYear && !hasUrl) {
+      issues.push({
+        type: 'incomplete', reference: ref,
+        detail: language === 'bm' ? 'Rujukan ini tidak mempunyai tahun penerbitan yang jelas.' : 'This reference is missing a clear publication year.',
+        suggestion: language === 'bm' ? 'Tambah tahun penerbitan dan nama penerbit untuk melengkapkan format rujukan.' : 'Add the publication year and publisher name to complete the reference format.',
+      });
     }
-    if (ref.length < 25 || !/[,.]/.test(ref)) {
-      issues.push({ type: 'format', reference: ref, detail: language === 'bm' ? 'Format rujukan ini tidak menepati standard akademik.' : 'This reference does not follow a standard academic format.', suggestion: language === 'bm' ? 'Susun mengikut format: Pengarang (Tahun). Tajuk. Penerbit.' : 'Arrange as: Author (Year). Title. Publisher.' });
+    if (ref.length < 25 || (!/[,.]/.test(ref) && !hasUrl)) {
+      issues.push({
+        type: 'format', reference: ref,
+        detail: language === 'bm' ? 'Format rujukan ini tidak menepati standard akademik.' : 'This reference does not follow a standard academic format.',
+        suggestion: language === 'bm' ? 'Susun mengikut format: Pengarang (Tahun). Tajuk. Penerbit.' : 'Arrange as: Author (Year). Title. Publisher.',
+      });
     }
     if (/\b(algoritma AI|dijana oleh AI|generated by AI|chatgpt)\b/i.test(ref)) {
-      issues.push({ type: 'hallucination', reference: ref, detail: language === 'bm' ? 'Rujukan ini kelihatan seperti rekaan halusinasi AI dan mungkin tidak wujud.' : 'This reference appears to be an AI hallucination and may not exist.', suggestion: language === 'bm' ? 'Semak semula sumber ini dalam pangkalan data akademik seperti Google Scholar atau DOI.org.' : 'Verify this source in an academic database such as Google Scholar or DOI.org.' });
+      issues.push({
+        type: 'hallucination', reference: ref,
+        detail: language === 'bm' ? 'Rujukan ini kelihatan seperti rekaan halusinasi AI dan mungkin tidak wujud.' : 'This reference appears to be an AI hallucination and may not exist.',
+        suggestion: language === 'bm' ? 'Semak semula sumber ini dalam pangkalan data akademik seperti Google Scholar atau DOI.org.' : 'Verify this source in an academic database such as Google Scholar or DOI.org.',
+      });
     }
   });
-  return { hasReferences: true, issues, references };
+
+  return { hasReferences: true, issues, references: entries.length ? entries : [...citations, ...urls] };
 }
 
+/* ---------- Analysis ---------- */
+
+function pickIndexes(total: number, count: number, offset: number): number[] {
+  const indexes: number[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const index = Math.min(total - 1, Math.floor(((i + 0.5 + offset * 0.5) / count) * total));
+    if (!indexes.includes(index)) indexes.push(index);
+  }
+  return indexes;
+}
+
+// Percentages are directly proportional to the number of marked sentences
+// over the total sentences in the main body only.
 function analyzeText(text: string, language: Language = 'bm'): { similarity: number; ai: number; internet: number; uitm: number; highlights: Highlight[]; referenceCheck: ReferenceCheck } {
-  const mainText = getMainContent(text);
+  const normalized = normalizeDocument(text);
+  const mainText = getMainContent(normalized);
   const referenceCheck = verifyReferences(text, language);
-  const sentences = mainText.match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.map((sentence) => sentence.trim()).filter(Boolean) ?? [];
-  const highlights = sentences.slice(0, 6).map((sentence, index) => {
-    const type = index % 3 === 1 ? 'ai' as const : 'similarity' as const;
-    const source = type === 'similarity' ? matchSources[index % matchSources.length] : undefined;
-    return { sentence, type, suggestions: generateSuggestions(sentence, index), source };
-  });
-  const similarity = Math.min(38, Math.max(8, Math.round(highlights.filter((item) => item.type === 'similarity').length * 6 + mainText.length / 240)));
-  const ai = Math.min(27, Math.max(6, Math.round(highlights.filter((item) => item.type === 'ai').length * 5 + mainText.length / 360)));
-  return { similarity, ai, internet: Math.round(similarity * 0.62), uitm: Math.round(similarity * 0.38), highlights, referenceCheck };
+  const sentences = splitSentences(mainText);
+  if (sentences.length === 0) return { similarity: 0, ai: 0, internet: 0, uitm: 0, highlights: [], referenceCheck };
+
+  const total = sentences.length;
+  const similarityCount = Math.min(4, Math.max(0, Math.round(total * 0.12)));
+  const aiCount = Math.min(3, Math.max(0, Math.round(total * 0.08)));
+
+  const marked = new Map<number, 'similarity' | 'ai'>();
+  pickIndexes(total, similarityCount, 0).forEach((index) => marked.set(index, 'similarity'));
+  pickIndexes(total, aiCount, 1).forEach((index) => { if (!marked.has(index)) marked.set(index, 'ai'); });
+
+  const highlights: Highlight[] = [...marked.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([index, type], order) => ({
+      sentence: sentences[index],
+      type,
+      suggestions: generateSuggestions(sentences[index], order),
+      source: type === 'similarity' ? matchSources[order % matchSources.length] : undefined,
+    }));
+
+  const similarity = Math.round((similarityCount / total) * 1000) / 10;
+  const ai = Math.round((aiCount / total) * 1000) / 10;
+  const internet = Math.round(similarity * 0.62 * 10) / 10;
+  const uitm = Math.round((similarity - internet) * 10) / 10;
+  return { similarity, ai, internet, uitm, highlights, referenceCheck };
 }
 
 async function extractText(file: File): Promise<string> {
-  if (file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
-    const result = await mammoth.convertToHtml({ arrayBuffer: await file.arrayBuffer() });
-    const parsed = new DOMParser().parseFromString(result.value, 'text/html');
-    return Array.from(parsed.body.querySelectorAll('p, h1, h2, h3, li')).map((element) => element.textContent?.trim()).filter(Boolean).join('\n\n');
-  }
   const pdf = await getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
   const pages: string[] = [];
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
@@ -164,6 +322,8 @@ async function extractText(file: File): Promise<string> {
   return pages.join('\n\n').trim();
 }
 
+/* ---------- UI ---------- */
+
 function Logo({ compact = false }: { compact?: boolean }) {
   return <div className={`brand ${compact ? 'brand-compact' : ''}`}><img src={logoPath} alt="Logo Universiti Teknologi MARA" /><div><strong>UiTM ScholarGuard</strong><span>Academic integrity workspace</span></div></div>;
 }
@@ -178,20 +338,50 @@ function Login({ onLogin }: { onLogin: (profile: UserProfile) => void }) {
 
 function StatCard({ label, value, tone, detail }: { label: string; value: string; tone: string; detail: string }) { return <div className={`stat-card ${tone}`}><div className="stat-top"><span>{label}</span><MoreHorizontal size={17} /></div><strong>{value}</strong><small>{detail}</small><div className="stat-line"><span /></div></div>; }
 
-function Dashboard({ user, activeDocument, onUpload, onSelectSentence, onNewReview, language }: { user: UserProfile; activeDocument: DocumentRecord | null; onUpload: (file: File) => void; onSelectSentence: (highlight: Highlight) => void; onNewReview: () => void; language: Language }) {
+function Dashboard({ user, activeDocument, onUpload, onSelectSentence, onNewReview, language, documents }: { user: UserProfile; activeDocument: DocumentRecord | null; onUpload: (file: File) => void; onSelectSentence: (highlight: Highlight) => void; onNewReview: () => void; language: Language; documents: DocumentRecord[] }) {
   const [dragging, setDragging] = useState(false); const [selectedFileName, setSelectedFileName] = useState(''); const fileInputRef = useRef<HTMLInputElement>(null);
   function chooseFile(file: File | undefined) { if (file) { setSelectedFileName(file.name); onUpload(file); } }
   function resetUpload() { setSelectedFileName(''); if (fileInputRef.current) fileInputRef.current.value = ''; onNewReview(); }
   function onDrop(event: DragEvent<HTMLDivElement>) { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files[0]); }
-  const highlights = activeDocument?.highlights ?? [];
-  const text = activeDocument?.extracted_text ?? '';
-  const pieces = text ? getTextPieces(text) : [];
-  return <div className="page-content"><div className="welcome-row"><div><p className="eyebrow">{t(language, user.role === 'Pensyarah' ? 'supervisionSpace' : 'learningSpace')} <span className="dot-live" /> {t(language, 'active')}</p><h1>{t(language, 'welcome')}, {user.email?.split('@')[0] || 'demo'}.</h1><p className="muted">{t(language, 'reviewPrompt')}</p></div><div className="date-chip"><span>{t(language, 'today')}</span><strong>{new Intl.DateTimeFormat('ms-MY', { day: '2-digit', month: 'long', year: 'numeric' }).format(new Date())}</strong></div></div><div className="stats-grid"><StatCard label={t(language, 'totalReviews')} value="24" tone="purple" detail={t(language, 'thisMonth')} /><StatCard label={t(language, 'averageSimilarity')} value="16.8%" tone="gold" detail={t(language, 'controlledRange')} /><StatCard label={t(language, 'savedDocuments')} value="18" tone="blue" detail={t(language, 'privateStorage')} /><StatCard label={t(language, 'integrityScore')} value="92" tone="green" detail={t(language, 'veryGood')} /></div>{!activeDocument ? <div className="upload-card" onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop}><div className={`upload-inner ${dragging ? 'dragging' : ''}`}><div className="upload-icon"><UploadCloud size={28} /></div><h2>{t(language, 'startReview')}</h2><p>{t(language, 'uploadHint')}</p><div className="upload-actions"><label className="primary-button"><UploadCloud size={17} /> {t(language, 'chooseFile')}<input ref={fileInputRef} type="file" accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden onChange={(event: ChangeEvent<HTMLInputElement>) => { chooseFile(event.target.files?.[0]); event.currentTarget.value = ''; }} /></label><span>PDF atau DOCX, maksimum 20 MB</span></div>{selectedFileName && <small className="selected-file">{selectedFileName}</small>}</div><div className="upload-footer"><span><Cloud size={16} /> {t(language, 'privateCloud')}</span><span><ShieldCheck size={16} /> {t(language, 'onlyYou')}</span></div></div> : <AnalysisView document={activeDocument} pieces={pieces} highlights={highlights} onSelectSentence={onSelectSentence} onNewReview={resetUpload} language={language} />}</div>;
+  const stats = useMemo(() => {
+    const total = documents.length;
+    const sum = (pick: (document: DocumentRecord) => number) => documents.reduce((accumulator, document) => accumulator + pick(document), 0);
+    const averageSimilarity = total ? sum((document) => Number(document.similarity_index)) / total : 0;
+    const averageIntegrity = total ? sum((document) => Math.max(0, 100 - Number(document.similarity_index) - Number(document.ai_detection))) / total : 0;
+    return { total, averageSimilarity, integrity: Math.round(averageIntegrity) };
+  }, [documents]);
+  return <div className="page-content"><div className="welcome-row"><div><p className="eyebrow">{t(language, user.role === 'Pensyarah' ? 'supervisionSpace' : 'learningSpace')} <span className="dot-live" /> {t(language, 'active')}</p><h1>{t(language, 'welcome')}, {user.email?.split('@')[0] || 'demo'}.</h1><p className="muted">{t(language, 'reviewPrompt')}</p></div><div className="date-chip"><span>{t(language, 'today')}</span><strong>{new Intl.DateTimeFormat('ms-MY', { day: '2-digit', month: 'long', year: 'numeric' }).format(new Date())}</strong></div></div><div className="stats-grid"><StatCard label={t(language, 'totalReviews')} value={String(stats.total)} tone="purple" detail={t(language, 'statAllTime')} /><StatCard label={t(language, 'averageSimilarity')} value={`${stats.averageSimilarity.toFixed(1)}%`} tone="gold" detail={t(language, 'statAverageDetail')} /><StatCard label={t(language, 'savedDocuments')} value={String(stats.total)} tone="blue" detail={t(language, 'statStoredDetail')} /><StatCard label={t(language, 'integrityScore')} value={String(stats.integrity)} tone="green" detail={t(language, 'statIntegrityDetail')} /></div>{!activeDocument ? <div className="upload-card" onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop}><div className={`upload-inner ${dragging ? 'dragging' : ''}`}><div className="upload-icon"><UploadCloud size={28} /></div><h2>{t(language, 'startReview')}</h2><p>{t(language, 'uploadHint')}</p><div className="upload-actions"><label className="primary-button"><UploadCloud size={17} /> {t(language, 'chooseFile')}<input ref={fileInputRef} type="file" accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden onChange={(event: ChangeEvent<HTMLInputElement>) => { chooseFile(event.target.files?.[0]); event.currentTarget.value = ''; }} /></label><span>PDF atau DOCX, maksimum 20 MB</span></div>{selectedFileName && <small className="selected-file">{selectedFileName}</small>}</div><div className="upload-footer"><span><Cloud size={16} /> {t(language, 'privateCloud')}</span><span><ShieldCheck size={16} /> {t(language, 'onlyYou')}</span></div></div> : <AnalysisView document={activeDocument} onSelectSentence={onSelectSentence} onNewReview={resetUpload} language={language} />}</div>;
 }
 
-function AnalysisView({ document, pieces, highlights, onSelectSentence, onNewReview, language }: { document: DocumentRecord; pieces: TextPiece[]; highlights: Highlight[]; onSelectSentence: (highlight: Highlight) => void; onNewReview: () => void; language: Language }) {
+function SentenceView({ sentence, marked, onSelectSentence }: { sentence: string; marked?: Highlight; onSelectSentence: (highlight: Highlight) => void }) {
+  const parts = sentence.split(/(https?:\/\/[^\s)>\]}"']+)/g);
+  return <button className={`sentence ${marked ? marked.type : ''}`} onClick={() => marked && onSelectSentence(marked)}>{parts.map((part, index) => /^https?:\/\//i.test(part)
+    ? <a key={index} href={part} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>{part}</a>
+    : <span key={index}>{part}</span>)}{marked && <span className="sentence-tag">{marked.type === 'ai' ? 'AI' : 'S'}</span>}</button>;
+}
+
+function DocumentBlocks({ document, highlights, onSelectSentence }: { document: DocumentRecord; highlights: Highlight[]; onSelectSentence: (highlight: Highlight) => void }) {
+  const blocks = useMemo<DisplayBlock[]>(() => {
+    const originalHtml = document.original_extract;
+    if (originalHtml) return splitHtmlBlocks(originalHtml);
+    return normalizeDocument(document.extracted_text).split('\n').map((line) => line.trim()).filter(Boolean).map((text) => ({ kind: 'text' as const, text }));
+  }, [document.original_extract, document.extracted_text]);
+  return <div className="document-text">{blocks.map((block, index) => {
+    if (block.kind === 'html') return <div className="doc-raw" key={index} dangerouslySetInnerHTML={{ __html: block.html ?? '' }} />;
+    if (block.kind === 'heading') {
+      const headingTags = ['h2', 'h3', 'h4', 'h5', 'h6'] as const;
+      const HeadingTag = headingTags[Math.min((block.level ?? 1) - 1, headingTags.length - 1)];
+      return <HeadingTag className="doc-heading" key={index}>{splitSentences(block.text ?? '').map((sentence, sentenceIndex) => <SentenceView key={sentenceIndex} sentence={sentence} marked={highlights.find((highlight) => highlight.sentence === sentence)} onSelectSentence={onSelectSentence} />)}</HeadingTag>;
+    }
+    return <p className="doc-paragraph" key={index}>{splitSentences(block.text ?? '').map((sentence, sentenceIndex) => <SentenceView key={sentenceIndex} sentence={sentence} marked={highlights.find((highlight) => highlight.sentence === sentence)} onSelectSentence={onSelectSentence} />)}</p>;
+  })}</div>;
+}
+
+function AnalysisView({ document, onSelectSentence, onNewReview, language }: { document: DocumentRecord; onSelectSentence: (highlight: Highlight) => void; onNewReview: () => void; language: Language }) {
+  const highlights = document.highlights ?? [];
   const refCheck = document.reference_check ?? { hasReferences: false, issues: [], references: [] };
-  return <section className="analysis-area"><div className="analysis-header"><div><p className="eyebrow"><Check size={15} /> {t(language, 'analysisComplete')}</p><h2>{document.file_name}</h2><p className="muted">Disemak {formatDate(document.created_at)} <span className="inline-separator">•</span> {formatBytes(document.file_size)}</p></div><button className="outline-button" onClick={onNewReview}><UploadCloud size={16} /> {t(language, 'newReview')}</button></div><div className="report-grid"><div className="report-score"><div className="score-ring" style={{ '--score': `${document.similarity_index * 3.6}deg` } as React.CSSProperties}><div><strong>{document.similarity_index}%</strong><span>Similarity</span></div></div><div><h3>{t(language, 'similarityIndex')}</h3><p className="muted">{t(language, 'similarityDescription')}</p><span className="status-pill warning">{t(language, 'needsReview')}</span></div></div><div className="report-score ai-score"><div className="score-ring" style={{ '--score': `${document.ai_detection * 3.6}deg` } as React.CSSProperties}><div><strong>{document.ai_detection}%</strong><span>AI Detection</span></div></div><div><h3>{t(language, 'aiDetection')}</h3><p className="muted">{t(language, 'aiDescription')}</p><span className="status-pill neutral">{t(language, 'low')}</span></div></div><div className="source-card"><div className="source-title"><h3>{t(language, 'detectedSources')}</h3><span>Jumlah</span></div><div className="source-item"><span><i className="source-dot internet" /> {t(language, 'internetSources')}</span><strong>{document.internet_sources}%</strong></div><div className="source-bar"><span style={{ width: `${Math.min(document.internet_sources * 2, 100)}%` }} /></div><div className="source-item"><span><i className="source-dot uitm" /> {t(language, 'uitmRepository')}</span><strong>{document.uitm_sources}%</strong></div><div className="source-bar gold-bar"><span style={{ width: `${Math.min(document.uitm_sources * 2.5, 100)}%` }} /></div></div></div><div className="reference-check-card"><div className="reference-check-header"><div className="ref-check-title"><div className="assistant-icon"><ShieldCheck size={18} /></div><div><span className="panel-kicker">{language === 'bm' ? 'Semakan Integriti Rujukan' : 'Reference Integrity Check'}</span><h3>{refCheck.hasReferences ? `${refCheck.references.length} ${language === 'bm' ? 'rujukan dikenal pasti' : 'references identified'}` : (language === 'bm' ? 'Tiada rujukan ditemui' : 'No references found')}</h3></div></div><span className={`status-pill ${refCheck.hasReferences && refCheck.issues.length === 0 ? 'success' : refCheck.issues.length > 0 ? 'warning' : 'neutral'}`}>{refCheck.hasReferences ? (refCheck.issues.length === 0 ? (language === 'bm' ? 'Siap' : 'Clean') : `${refCheck.issues.length} ${language === 'bm' ? 'isu' : 'issues'}`) : (language === 'bm' ? 'Perlu tindakan' : 'Action needed')}</span></div>{!refCheck.hasReferences && <div className="ref-issue"><AlertTriangle size={15} /><div><strong>{language === 'bm' ? 'Amaran: Tiada bahagian Rujukan / Bibliografi' : 'Warning: No References / Bibliography section'}</strong><p>{language === 'bm' ? 'Dokumen ini tidak mempunyai senarai rujukan. Setiap tugasan akademik mesti menyenaraikan sumber yang dirujuk.' : 'This document has no reference list. Every academic assignment must cite its sources.'}</p></div></div>}{refCheck.issues.map((issue, index) => <div className="ref-issue" key={`${issue.reference}-${index}`}><ShieldAlert size={15} /><div><strong>{issue.reference ? issue.reference.slice(0, 80) + (issue.reference.length > 80 ? '...' : '') : (language === 'bm' ? 'Isu format' : 'Format issue')}</strong><p>{issue.detail}</p><span className="ref-fix"><Link2 size={12} /> {issue.suggestion}</span></div></div>)}</div><div className="analysis-workspace"><div className="document-panel"><div className="panel-heading"><div><span className="panel-kicker">{t(language, 'documentView')}</span><h3>{t(language, 'interactiveReview')}</h3></div><div className="legend"><span><i className="legend-dot red" /> {t(language, 'highSimilarity')}</span><span><i className="legend-dot yellow" /> {t(language, 'aiSignal')}</span></div></div><div className="document-text">{pieces.map((piece, index) => { const marked = highlights.find((highlight) => highlight.sentence === piece.text); return <div className="document-line" key={`${piece.text}-${index}`}><button className={`sentence ${marked ? marked.type : ''}`} onClick={() => marked && onSelectSentence(marked)}>{piece.text}{marked && <span className="sentence-tag">{marked.type === 'ai' ? 'AI' : 'S'} </span>}</button></div>; })}</div></div><div className="assistant-panel"><div className="assistant-top"><div className="assistant-icon"><Bot size={18} /></div><div><span className="panel-kicker">ScholarGuard AI</span><h3>{t(language, 'assistant')}</h3></div></div><div className="assistant-empty"><Sparkles size={26} /><h4>{t(language, 'chooseSentence')}</h4><p>{t(language, 'clickMarked')}</p></div></div></div></section>;
+  const safeSimilarity = document.similarity_index <= 30;
+  return <section className="analysis-area"><div className="analysis-header"><div><p className="eyebrow"><Check size={15} /> {t(language, 'analysisComplete')}</p><h2>{document.file_name}</h2><p className="muted">Disemak {formatDate(document.created_at)} <span className="inline-separator">•</span> {formatBytes(document.file_size)}</p></div><button className="outline-button" onClick={onNewReview}><UploadCloud size={16} /> {t(language, 'newReview')}</button></div><div className="report-grid"><div className="report-score"><div className="score-ring" style={{ '--score': `${document.similarity_index * 3.6}deg` } as React.CSSProperties}><div><strong>{document.similarity_index}%</strong><span>Similarity</span></div></div><div><h3>{t(language, 'similarityIndex')}</h3><p className="muted">{t(language, 'similarityDescription')}</p><span className={`status-pill ${safeSimilarity ? 'success' : 'warning'}`}>{safeSimilarity ? t(language, 'safeRange') : t(language, 'needsReview')}</span></div></div><div className="report-score ai-score"><div className="score-ring" style={{ '--score': `${document.ai_detection * 3.6}deg` } as React.CSSProperties}><div><strong>{document.ai_detection}%</strong><span>AI Detection</span></div></div><div><h3>{t(language, 'aiDetection')}</h3><p className="muted">{t(language, 'aiDescription')}</p><span className="status-pill neutral">{document.ai_detection > 20 ? t(language, 'needsReview') : t(language, 'low')}</span></div></div><div className="source-card"><div className="source-title"><h3>{t(language, 'detectedSources')}</h3><span>Jumlah</span></div><div className="source-item"><span><i className="source-dot internet" /> {t(language, 'internetSources')}</span><strong>{document.internet_sources}%</strong></div><div className="source-bar"><span style={{ width: `${Math.min(document.internet_sources * 2, 100)}%` }} /></div><div className="source-item"><span><i className="source-dot uitm" /> {t(language, 'uitmRepository')}</span><strong>{document.uitm_sources}%</strong></div><div className="source-bar gold-bar"><span style={{ width: `${Math.min(document.uitm_sources * 2.5, 100)}%` }} /></div></div></div><div className="reference-check-card"><div className="reference-check-header"><div className="ref-check-title"><div className="assistant-icon"><ShieldCheck size={18} /></div><div><span className="panel-kicker">{language === 'bm' ? 'Semakan Integriti Rujukan' : 'Reference Integrity Check'}</span><h3>{refCheck.hasReferences ? `${refCheck.references.length} ${language === 'bm' ? 'rujukan dikenal pasti' : 'references identified'}` : (language === 'bm' ? 'Tiada rujukan ditemui' : 'No references found')}</h3></div></div><span className={`status-pill ${refCheck.hasReferences && refCheck.issues.length === 0 ? 'success' : refCheck.issues.length > 0 ? 'warning' : 'neutral'}`}>{refCheck.hasReferences ? (refCheck.issues.length === 0 ? (language === 'bm' ? 'Siap' : 'Clean') : `${refCheck.issues.length} ${language === 'bm' ? 'isu' : 'issues'}`) : (language === 'bm' ? 'Perlu tindakan' : 'Action needed')}</span></div>{!refCheck.hasReferences && <div className="ref-issue"><AlertTriangle size={15} /><div><strong>{language === 'bm' ? 'Amaran: Tiada bahagian Rujukan / Bibliografi' : 'Warning: No References / Bibliography section'}</strong><p>{language === 'bm' ? 'Dokumen ini tidak mempunyai senarai rujukan. Setiap tugasan akademik mesti menyenaraikan sumber yang dirujuk.' : 'This document has no reference list. Every academic assignment must cite its sources.'}</p></div></div>}{refCheck.issues.map((issue, index) => <div className="ref-issue" key={`${issue.reference}-${index}`}><ShieldAlert size={15} /><div><strong>{issue.reference ? issue.reference.slice(0, 80) + (issue.reference.length > 80 ? '...' : '') : (language === 'bm' ? 'Isu format' : 'Format issue')}</strong><p>{issue.detail}</p><span className="ref-fix"><Link2 size={12} /> {issue.suggestion}</span></div></div>)}</div><div className="analysis-workspace"><div className="document-panel"><div className="panel-heading"><div><span className="panel-kicker">{t(language, 'documentView')}</span><h3>{t(language, 'interactiveReview')}</h3></div><div className="legend"><span><i className="legend-dot red" /> {t(language, 'highSimilarity')}</span><span><i className="legend-dot yellow" /> {t(language, 'aiSignal')}</span></div></div><DocumentBlocks document={document} highlights={highlights} onSelectSentence={onSelectSentence} /></div><div className="assistant-panel"><div className="assistant-top"><div className="assistant-icon"><Bot size={18} /></div><div><span className="panel-kicker">ScholarGuard AI</span><h3>{t(language, 'assistant')}</h3></div></div><div className="assistant-empty"><Sparkles size={26} /><h4>{t(language, 'chooseSentence')}</h4><p>{t(language, 'clickMarked')}</p></div></div></div></section>;
 }
 
 function Assistant({ highlight, onClose, language }: { highlight: Highlight | null; onClose: () => void; language: Language }) { const [suggestions, setSuggestions] = useState<string[]>(highlight?.suggestions ?? []); const [variation, setVariation] = useState(0); useEffect(() => { setSuggestions(highlight?.suggestions ?? []); setVariation(0); }, [highlight]); if (!highlight) return null; const selectedHighlight = highlight; function regenerate() { const nextVariation = variation + 1; setVariation(nextVariation); setSuggestions(generateSuggestions(selectedHighlight.sentence, nextVariation)); } return <aside className="assistant-drawer"><button className="drawer-close" onClick={onClose}><X size={18} /></button><div className={`issue-badge ${selectedHighlight.type}`}><span>{selectedHighlight.type === 'ai' ? (language === 'bm' ? 'Petunjuk AI' : 'AI signal') : (language === 'bm' ? 'Persamaan teks' : 'Text similarity')}</span></div><h3>{t(language, 'improveSentence')}</h3><p className="original-quote">“{selectedHighlight.sentence}”</p>{selectedHighlight.source && selectedHighlight.type === 'similarity' && <div className="match-evidence"><p className="panel-kicker">{language === 'bm' ? 'Bukti Sumber Padanan' : 'Matched Source Evidence'}</p><div className="match-card"><div className="match-row"><strong>{selectedHighlight.source.sourceName}</strong><span className="match-type">{selectedHighlight.source.sourceType}</span></div><div className="match-location"><FileText size={13} /> {selectedHighlight.source.location}</div><div className="match-percent"><span className="match-bar"><span style={{ width: `${selectedHighlight.source.matchPercent}%` }} /></span><strong>{selectedHighlight.source.matchPercent}% {language === 'bm' ? 'Padanan Tepat' : 'Exact Match'}</strong></div><a className="match-link" href={selectedHighlight.source.url} target="_blank" rel="noreferrer"><ExternalLink size={13} /> {language === 'bm' ? 'Semak sumber asal' : 'View original source'}</a></div><div className="match-warning"><AlertTriangle size={14} /> {language === 'bm' ? 'Menyalin ayat sumber secara terus tanpa olahan sendiri atau tanda petikan adalah tidak dibenarkan.' : 'Copying source sentences directly without paraphrasing or quotation marks is not permitted.'}</div></div>}<div className="suggestion-list"><div className="suggestion-heading"><p className="panel-kicker">{t(language, 'academicSuggestions')}</p><button className="regenerate-button" onClick={regenerate}><RefreshCw size={13} /> {language === 'bm' ? 'Jana Cadangan Lain' : 'Generate other suggestions'}</button></div>{suggestions.map((suggestion, index) => <div className="suggestion-card" key={suggestion}><span>0{index + 1}</span><p>{suggestion}</p><button onClick={() => navigator.clipboard.writeText(suggestion)}><Clipboard size={14} /> {t(language, 'copy')}</button></div>)}</div><div className="drawer-tip"><Sparkles size={16} /><span>{t(language, 'assistantTip')}</span></div></aside>; }
@@ -205,12 +395,12 @@ function App() { const [user, setUser] = useState<UserProfile | null>(null); con
   useEffect(() => { document.documentElement.lang = language === 'bm' ? 'ms' : 'en'; localStorage.setItem('scholar-language', language); }, [language]);
   useEffect(() => { supabase.auth.getSession().then(({ data }) => { if (data.session?.user) setUser({ id: data.session.user.id, email: data.session.user.email, role: getRole(data.session.user.email ?? '') }); }); }, []);
   useEffect(() => { if (!user || user.demo) return; supabase.from('scholar_documents').select('*').order('created_at', { ascending: false }).then(({ data }) => { if (data) setDocuments(data as DocumentRecord[]); }); }, [user]);
-  async function handleUpload(file: File) { if (!user) return; setError(''); const allowed = ['application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']; if (!allowed.includes(file.type) || file.size > 20971520) { setError('Muat naik fail PDF atau DOCX dengan saiz maksimum 20 MB.'); return; } setAnalyzing(true); try { const text = user.demo ? demoText : await extractText(file); const analysis = analyzeText(text || demoText, language); const documentData: DocumentRecord = { id: crypto.randomUUID(), file_name: file.name, file_type: file.type, file_size: file.size, extracted_text: text || demoText, similarity_index: analysis.similarity, ai_detection: analysis.ai, internet_sources: analysis.internet, uitm_sources: analysis.uitm, highlights: analysis.highlights, suggestions: analysis.highlights, reference_check: analysis.referenceCheck, status: 'completed', created_at: new Date().toISOString() }; await new Promise((resolve) => window.setTimeout(resolve, 1800)); if (!user.demo) { const storagePath = `${user.id}/${documentData.id}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '-')}`; const uploadResult = await supabase.storage.from('scholar-documents').upload(storagePath, file, { upsert: false, contentType: file.type }); if (uploadResult.error) throw uploadResult.error; const insertResult = await supabase.from('scholar_documents').insert({ ...documentData, storage_path: storagePath }).select().maybeSingle(); if (insertResult.error || !insertResult.data) throw insertResult.error ?? new Error('Unable to save'); setDocuments((current) => [insertResult.data as DocumentRecord, ...current]); setActiveDocument(insertResult.data as DocumentRecord); } else { setDocuments((current) => [documentData, ...current]); setActiveDocument(documentData); } } catch (cause) { console.error(cause); setError('Dokumen tidak dapat diproses. Sila cuba fail lain.'); } finally { setAnalyzing(false); } }
+  async function handleUpload(file: File) { if (!user) return; setError(''); const allowed = ['application/pdf', DOCX_TYPE]; if (!allowed.includes(file.type) || file.size > 20971520) { setError('Muat naik fail PDF atau DOCX dengan saiz maksimum 20 MB.'); return; } setAnalyzing(true); try { const isDocx = file.type === DOCX_TYPE; let originalHtml = ''; let text = ''; if (user.demo) { text = demoText; } else if (isDocx) { originalHtml = (await mammoth.convertToHtml({ arrayBuffer: await file.arrayBuffer() })).value; text = htmlToPlainText(originalHtml); } else { text = await extractText(file); } const analysis = analyzeText(text || demoText, language); const documentData: DocumentRecord = { id: crypto.randomUUID(), file_name: file.name, file_type: file.type, file_size: file.size, extracted_text: text || demoText, original_extract: originalHtml || null, similarity_index: analysis.similarity, ai_detection: analysis.ai, internet_sources: analysis.internet, uitm_sources: analysis.uitm, highlights: analysis.highlights, suggestions: analysis.highlights, reference_check: analysis.referenceCheck, status: 'completed', created_at: new Date().toISOString() }; await new Promise((resolve) => window.setTimeout(resolve, 1200)); if (!user.demo) { const storagePath = `${user.id}/${documentData.id}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '-')}`; const uploadResult = await supabase.storage.from('scholar-documents').upload(storagePath, file, { upsert: false, contentType: file.type }); if (uploadResult.error) throw uploadResult.error; const insertResult = await supabase.from('scholar_documents').insert({ ...documentData, storage_path: storagePath }).select().maybeSingle(); if (insertResult.error || !insertResult.data) throw insertResult.error ?? new Error('Unable to save'); setDocuments((current) => [insertResult.data as DocumentRecord, ...current]); setActiveDocument(insertResult.data as DocumentRecord); } else { setDocuments((current) => [documentData, ...current]); setActiveDocument(documentData); } } catch (cause) { console.error(cause); setError('Dokumen tidak dapat diproses. Sila cuba fail lain.'); } finally { setAnalyzing(false); } }
   function startNewReview() { setActiveDocument(null); setSelectedHighlight(null); setError(''); }
   async function deleteDocument(document: DocumentRecord) { if (!user || !window.confirm('Padam rekod semakan ini?')) return; if (!user.demo) { await supabase.from('scholar_documents').delete().eq('id', document.id); await supabase.storage.from('scholar-documents').remove([`${user.id}/${document.id}-${document.file_name.replace(/[^a-zA-Z0-9._-]/g, '-')}`]); } setDocuments((current) => current.filter((item) => item.id !== document.id)); if (activeDocument?.id === document.id) setActiveDocument(null); }
   function downloadReport(document: DocumentRecord) { const pdf = new jsPDF(); pdf.setFont('helvetica', 'bold'); pdf.setFontSize(18); pdf.text('UiTM ScholarGuard', 20, 22); pdf.setFontSize(11); pdf.setFont('helvetica', 'normal'); pdf.text('Laporan Semakan Integriti Akademik', 20, 30); pdf.setFont('helvetica', 'bold'); pdf.text(document.file_name, 20, 45); pdf.setFont('helvetica', 'normal'); pdf.text(`Tarikh: ${formatDate(document.created_at)}`, 20, 53); pdf.text(`Similarity Index: ${document.similarity_index}%`, 20, 70); pdf.text(`AI Detection: ${document.ai_detection}%`, 20, 78); pdf.text(`Internet Sources: ${document.internet_sources}%`, 20, 86); pdf.text(`UiTM Repository: ${document.uitm_sources}%`, 20, 94); pdf.setFont('helvetica', 'italic'); pdf.text('Laporan ini ialah bantuan semakan akademik dan bukan penghakiman muktamad.', 20, 115); pdf.save(`${document.file_name.replace(/\.(pdf|docx)$/i, '')}-laporan.pdf`); }
   async function logout() { if (user && !user.demo) await supabase.auth.signOut(); setUser(null); setDocuments([]); setActiveDocument(null); }
   if (!user) return <Login onLogin={setUser} />;
-  return <div className="app-shell"><header className="topbar"><button className="mobile-menu"><Menu size={20} /></button><button className="brand-button" onClick={() => { setPage('dashboard'); setActiveDocument(null); }}><Logo compact /></button><nav><button className={page === 'dashboard' ? 'active' : ''} onClick={() => setPage('dashboard')}><LayoutDashboard size={16} /> {t(language, 'dashboard')}</button><button className={page === 'history' ? 'active' : ''} onClick={() => setPage('history')}><HistoryIcon size={16} /> {t(language, 'history')}</button><button className={page === 'repository' ? 'active' : ''} onClick={() => setPage('repository')}><BookOpen size={16} /> {t(language, 'repository')}</button></nav><div className="topbar-actions"><div className="language-toggle" role="group" aria-label="Pilih bahasa"><button className={language === 'bm' ? 'selected' : ''} onClick={() => setLanguage('bm')}>BM</button><button className={language === 'en' ? 'selected' : ''} onClick={() => setLanguage('en')}>EN</button></div><button className="theme-toggle" onClick={() => setDark(!dark)} aria-label="Tukar tema">{dark ? <Sun size={18} /> : <Moon size={18} />}</button><div className="user-menu"><div className="avatar"><UserRound size={16} /></div><div><strong>{user.role}</strong><span>{user.email?.split('@')[0]}</span></div></div><button className="logout-button" onClick={logout} title="Log keluar"><LogOut size={17} /></button></div></header><main>{analyzing && <div className="analysis-overlay"><div className="analysis-loader"><div className="loader-mark"><Bot size={26} /></div><h2>{t(language, 'analyzing')}</h2><p>{t(language, 'analyzingDescription')}</p><div className="loader-bar"><span /></div><small>{t(language, 'processing')}</small></div></div>}{error && <div className="toast-error"><X size={16} /> {error}<button onClick={() => setError('')}><X size={14} /></button></div>}{page === 'dashboard' && <Dashboard user={user} activeDocument={activeDocument} onUpload={handleUpload} onSelectSentence={setSelectedHighlight} onNewReview={startNewReview} language={language} />}{page === 'history' && <History documents={documents} onOpen={(document) => { setPage('dashboard'); setActiveDocument(document); }} onDelete={deleteDocument} onDownload={downloadReport} language={language} />}{page === 'repository' && <Repository language={language} />}</main><Assistant highlight={selectedHighlight} onClose={() => setSelectedHighlight(null)} language={language} /></div>; }
+  return <div className="app-shell"><header className="topbar"><button className="mobile-menu"><Menu size={20} /></button><button className="brand-button" onClick={() => { setPage('dashboard'); setActiveDocument(null); }}><Logo compact /></button><nav><button className={page === 'dashboard' ? 'active' : ''} onClick={() => setPage('dashboard')}><LayoutDashboard size={16} /> {t(language, 'dashboard')}</button><button className={page === 'history' ? 'active' : ''} onClick={() => setPage('history')}><HistoryIcon size={16} /> {t(language, 'history')}</button><button className={page === 'repository' ? 'active' : ''} onClick={() => setPage('repository')}><BookOpen size={16} /> {t(language, 'repository')}</button></nav><div className="topbar-actions"><div className="language-toggle" role="group" aria-label="Pilih bahasa"><button className={language === 'bm' ? 'selected' : ''} onClick={() => setLanguage('bm')}>BM</button><button className={language === 'en' ? 'selected' : ''} onClick={() => setLanguage('en')}>EN</button></div><button className="theme-toggle" onClick={() => setDark(!dark)} aria-label="Tukar tema">{dark ? <Sun size={18} /> : <Moon size={18} />}</button><div className="user-menu"><div className="avatar"><UserRound size={16} /></div><div><strong>{user.role}</strong><span>{user.email?.split('@')[0]}</span></div></div><button className="logout-button" onClick={logout} title="Log keluar"><LogOut size={17} /></button></div></header><main>{analyzing && <div className="analysis-overlay"><div className="analysis-loader"><div className="loader-mark"><Bot size={26} /></div><h2>{t(language, 'analyzing')}</h2><p>{t(language, 'analyzingDescription')}</p><div className="loader-bar"><span /></div><small>{t(language, 'processing')}</small></div></div>}{error && <div className="toast-error"><X size={16} /> {error}<button onClick={() => setError('')}><X size={14} /></button></div>}{page === 'dashboard' && <Dashboard user={user} activeDocument={activeDocument} onUpload={handleUpload} onSelectSentence={setSelectedHighlight} onNewReview={startNewReview} language={language} documents={documents} />}{page === 'history' && <History documents={documents} onOpen={(document) => { setPage('dashboard'); setActiveDocument(document); }} onDelete={deleteDocument} onDownload={downloadReport} language={language} />}{page === 'repository' && <Repository language={language} />}</main><Assistant highlight={selectedHighlight} onClose={() => setSelectedHighlight(null)} language={language} /></div>; }
 
 export default App;
